@@ -394,7 +394,7 @@ describe('externalUpdateProposalStatus route', () => {
   //  Handler — state guard (proposal not in submitted state)
   // ──────────────────────────────────────────────────────
   describe('handler — state guard', () => {
-    it('should return 422 when the proposal is not in the submitted state', async () => {
+    it('should return 422 when the transition is not permitted', async () => {
       const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
       ProjectService.prototype.getProjectByReference = vi
         .fn()
@@ -419,14 +419,14 @@ describe('externalUpdateProposalStatus route', () => {
           {
             referenceNumber: 'ANC501E-000A-001A',
             errorCode: 'INVALID_STATE',
-            message: `Proposal 'ANC501E-000A-001A' can only be updated when in the submitted state`
+            message: `Proposal 'ANC501E-000A-001A' cannot be moved from 'draft' to 'approved'`
           }
         ]
       })
       expect(ProjectService.prototype.upsertProjectState).not.toHaveBeenCalled()
     })
 
-    it('should return 207 when one proposal is submitted and another is not', async () => {
+    it('should return 207 when one transition is allowed and another is not', async () => {
       const project1 = { id: 1n, reference_number: 'ANC501E/000A/001A' }
       const project2 = { id: 2n, reference_number: 'ANC501E/000B/001A' }
 
@@ -460,6 +460,149 @@ describe('externalUpdateProposalStatus route', () => {
       expect(ProjectService.prototype.upsertProjectState).toHaveBeenCalledTimes(
         1
       )
+    })
+
+    it.each([
+      ['submitted', 'draft'],
+      ['submitted', 'approved'],
+      ['submitted', 'rejected'],
+      ['approved', 'draft']
+    ])('should allow %s → %s', async (currentState, targetStatus) => {
+      const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
+      ProjectService.prototype.getProjectByReference = vi
+        .fn()
+        .mockResolvedValue(mockProject)
+      ProjectService.prototype.upsertProjectState = vi
+        .fn()
+        .mockResolvedValue({})
+
+      const { h } = buildH()
+      const request = buildRequest([
+        { referenceNumber: 'ANC501E-000A-001A', status: targetStatus }
+      ])
+      request.prisma.pafs_core_states.findFirst.mockResolvedValue({
+        state: currentState
+      })
+
+      await externalUpdateProposalStatus.options.handler(request, h)
+
+      expect(ProjectService.prototype.upsertProjectState).toHaveBeenCalledWith(
+        mockProject.id,
+        targetStatus
+      )
+    })
+
+    it.each([
+      ['approved', 'rejected'],
+      ['rejected', 'draft'],
+      ['rejected', 'approved'],
+      ['draft', 'approved'],
+      ['draft', 'rejected']
+    ])('should reject %s → %s', async (currentState, targetStatus) => {
+      const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
+      ProjectService.prototype.getProjectByReference = vi
+        .fn()
+        .mockResolvedValue(mockProject)
+      ProjectService.prototype.upsertProjectState = vi
+        .fn()
+        .mockResolvedValue({})
+
+      const { h } = buildH()
+      const request = buildRequest([
+        { referenceNumber: 'ANC501E-000A-001A', status: targetStatus }
+      ])
+      request.prisma.pafs_core_states.findFirst.mockResolvedValue({
+        state: currentState
+      })
+
+      const result = await externalUpdateProposalStatus.options.handler(
+        request,
+        h
+      )
+
+      expect(result.statusCode).toBe(HTTP_STATUS.UNPROCESSABLE_ENTITY)
+      expect(result.data.errors[0].message).toContain(
+        `cannot be moved from '${currentState}' to '${targetStatus}'`
+      )
+      expect(ProjectService.prototype.upsertProjectState).not.toHaveBeenCalled()
+    })
+
+    it('should reject any change to a proposal already in draft', async () => {
+      const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
+      ProjectService.prototype.getProjectByReference = vi
+        .fn()
+        .mockResolvedValue(mockProject)
+      ProjectService.prototype.upsertProjectState = vi
+        .fn()
+        .mockResolvedValue({})
+
+      const { h } = buildH()
+      const request = buildRequest([
+        { referenceNumber: 'ANC501E-000A-001A', status: 'rejected' }
+      ])
+      request.prisma.pafs_core_states.findFirst.mockResolvedValue({
+        state: 'draft'
+      })
+
+      const result = await externalUpdateProposalStatus.options.handler(
+        request,
+        h
+      )
+
+      expect(result.statusCode).toBe(HTTP_STATUS.UNPROCESSABLE_ENTITY)
+      expect(ProjectService.prototype.upsertProjectState).not.toHaveBeenCalled()
+    })
+
+    it('should treat re-sending the current status as an idempotent success', async () => {
+      const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
+      ProjectService.prototype.getProjectByReference = vi
+        .fn()
+        .mockResolvedValue(mockProject)
+      ProjectService.prototype.upsertProjectState = vi
+        .fn()
+        .mockResolvedValue({})
+
+      const { h } = buildH()
+      const request = buildRequest([
+        { referenceNumber: 'ANC501E-000A-001A', status: 'draft' }
+      ])
+      request.prisma.pafs_core_states.findFirst.mockResolvedValue({
+        state: 'draft'
+      })
+
+      await externalUpdateProposalStatus.options.handler(request, h)
+
+      expect(ProjectService.prototype.upsertProjectState).toHaveBeenCalledWith(
+        mockProject.id,
+        'draft'
+      )
+    })
+
+    it('should reject a transition when the project has no state record', async () => {
+      const mockProject = { id: 1n, reference_number: 'ANC501E/000A/001A' }
+      ProjectService.prototype.getProjectByReference = vi
+        .fn()
+        .mockResolvedValue(mockProject)
+      ProjectService.prototype.upsertProjectState = vi
+        .fn()
+        .mockResolvedValue({})
+
+      const { h } = buildH()
+      const request = buildRequest([
+        { referenceNumber: 'ANC501E-000A-001A', status: 'draft' }
+      ])
+      request.prisma.pafs_core_states.findFirst.mockResolvedValue(null)
+
+      const result = await externalUpdateProposalStatus.options.handler(
+        request,
+        h
+      )
+
+      expect(result.statusCode).toBe(HTTP_STATUS.UNPROCESSABLE_ENTITY)
+      expect(result.data.errors[0].message).toContain(
+        "cannot be moved from 'unknown' to 'draft'"
+      )
+      expect(ProjectService.prototype.upsertProjectState).not.toHaveBeenCalled()
     })
   })
 
