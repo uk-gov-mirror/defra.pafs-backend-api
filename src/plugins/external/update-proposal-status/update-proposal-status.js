@@ -27,7 +27,54 @@ import { validationFailAction } from '../../../common/helpers/validation-fail-ac
  * 422 when all fail; 400 when the payload itself is invalid.
  */
 
-const ALLOWED_EXTERNAL_STATUSES = ['draft', 'approved', 'rejected']
+const ALLOWED_EXTERNAL_STATUSES = [
+  PROJECT_STATUS.DRAFT,
+  PROJECT_STATUS.APPROVED,
+  PROJECT_STATUS.REJECTED
+]
+
+/**
+ * Permitted state transitions driven by the external system (AIMS PD).
+ *
+ * Keyed by the project's CURRENT state; the value is the set of states AIMS PD
+ * may move it to.
+ *
+ * `approved` → `draft` is the "back to draft" path: AIMS PD has returned the
+ * proposal for further work, which makes it editable again for RMA users (see
+ * EDITABLE_STATUSES).
+ *
+ * `draft` and `rejected` are deliberately absent as source states — a proposal
+ * that is already editable in PAFS must not be mutated by the external system,
+ * and a rejected proposal is terminal.
+ */
+const ALLOWED_EXTERNAL_TRANSITIONS = {
+  [PROJECT_STATUS.SUBMITTED]: [
+    PROJECT_STATUS.DRAFT,
+    PROJECT_STATUS.APPROVED,
+    PROJECT_STATUS.REJECTED
+  ],
+  [PROJECT_STATUS.APPROVED]: [PROJECT_STATUS.DRAFT]
+}
+
+/**
+ * Determine whether AIMS PD may move a proposal from `currentState` to
+ * `targetStatus`.
+ *
+ * Re-applying the state a proposal is already in is treated as valid so that
+ * retries from AIMS PD are idempotent rather than reported as failures.
+ *
+ * @param {string|null} currentState - The project's current state
+ * @param {string} targetStatus - The requested new status
+ * @returns {boolean}
+ */
+const isTransitionAllowed = (currentState, targetStatus) => {
+  if (currentState === targetStatus) {
+    return true
+  }
+  return (ALLOWED_EXTERNAL_TRANSITIONS[currentState] ?? []).includes(
+    targetStatus
+  )
+}
 
 const proposalItemSchema = Joi.object({
   referenceNumber: Joi.string()
@@ -58,6 +105,11 @@ const externalUpdateProposalStatus = {
     notes:
       'Updates the status of one or more FCERM project proposals. ' +
       'Each proposal specifies its own reference number and target status (`draft`, `approved`, or `rejected`). ' +
+      'A proposal may be moved from `submitted` to any of the three statuses, and from ' +
+      '`approved` back to `draft` (which returns it to the RMA for editing). ' +
+      'Proposals already in `draft`, and proposals that have been `rejected`, cannot be changed ' +
+      'by the external system. ' +
+      'Re-sending the status a proposal already holds is treated as a success so retries are idempotent. ' +
       'Authentication is handled by the CDP API Gateway using AWS Cognito ' +
       'client-credentials; this endpoint must NOT be called directly — ' +
       'always go via the public API Gateway. ' +
@@ -119,7 +171,7 @@ const externalUpdateProposalStatus = {
             select: { state: true }
           })
           const currentState = stateRecord?.state ?? null
-          if (currentState !== PROJECT_STATUS.SUBMITTED) {
+          if (!isTransitionAllowed(currentState, status)) {
             request.metrics.counter('externalStatusUpdateItem', 1, {
               outcome: 'invalid_state',
               status
@@ -128,7 +180,7 @@ const externalUpdateProposalStatus = {
               referenceNumber: raw,
               success: false,
               errorCode: 'INVALID_STATE',
-              message: `Proposal '${raw}' can only be updated when in the submitted state`
+              message: `Proposal '${raw}' cannot be moved from '${currentState ?? 'unknown'}' to '${status}'`
             })
             hasFailure = true
             continue
